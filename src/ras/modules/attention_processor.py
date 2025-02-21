@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import math
-import torch
-from ..utils import ras_manager
 from typing import Callable, List, Optional, Tuple, Union
-from torch import nn
-from diffusers.models.attention_processor import Attention
+
+import torch
 import torch.nn.functional as F
+from diffusers.models.attention_processor import Attention
+from torch import nn
+
+from ras.utils import ras_manager
+
 
 class RASLuminaAttnProcessor2_0:
     r"""

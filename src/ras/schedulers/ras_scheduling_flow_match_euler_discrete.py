@@ -20,13 +20,12 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.utils import BaseOutput, logging
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from ras.utils import ras_manager
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
+from diffusers.utils import BaseOutput, logging
 
+from ras.utils import ras_manager
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -77,52 +76,100 @@ class RASFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         max_image_seq_len: Optional[int] = 4096,
         invert_sigmas: bool = False,
     ):
-        super().__init__(num_train_timesteps=num_train_timesteps,
-                         shift=shift,
-                         use_dynamic_shifting=use_dynamic_shifting,
-                         base_shift=base_shift,
-                         max_shift=max_shift,
-                         base_image_seq_len=base_image_seq_len,
-                         max_image_seq_len=max_image_seq_len,
-                        #  invert_sigmas=invert_sigmas
-                         )
+        super().__init__(
+            num_train_timesteps=num_train_timesteps,
+            shift=shift,
+            use_dynamic_shifting=use_dynamic_shifting,
+            base_shift=base_shift,
+            max_shift=max_shift,
+            base_image_seq_len=base_image_seq_len,
+            max_image_seq_len=max_image_seq_len,
+            #  invert_sigmas=invert_sigmas
+        )
         self.drop_cnt = None
 
-
     def _init_ras_config(self, latents):
-        self.drop_cnt = torch.zeros((latents.shape[-2] // ras_manager.MANAGER.patch_size * latents.shape[-1] // ras_manager.MANAGER.patch_size), device=latents.device) - len(self.sigmas)
+        self.drop_cnt = torch.zeros(
+            (
+                latents.shape[-2]
+                // ras_manager.MANAGER.patch_size
+                * latents.shape[-1]
+                // ras_manager.MANAGER.patch_size
+            ),
+            device=latents.device,
+        ) - len(self.sigmas)
 
     def extract_latents_index_from_patched_latents_index(self, indices, height):
         # # TODO add non-square case
         # # TODO support PATCH_SIZE != 2
-        flattened_indices = indices // (height // ras_manager.MANAGER.patch_size) * ras_manager.MANAGER.patch_size * height + indices % (height // ras_manager.MANAGER.patch_size) *ras_manager.MANAGER.patch_size
-        flattened_indices = (flattened_indices[:, None] + torch.tensor([0, height + 1, 1, height], dtype=indices.dtype, device=indices.device)[None, :]).flatten()
+        flattened_indices = (
+            indices
+            // (height // ras_manager.MANAGER.patch_size)
+            * ras_manager.MANAGER.patch_size
+            * height
+            + indices
+            % (height // ras_manager.MANAGER.patch_size)
+            * ras_manager.MANAGER.patch_size
+        )
+        flattened_indices = (
+            flattened_indices[:, None]
+            + torch.tensor(
+                [0, height + 1, 1, height], dtype=indices.dtype, device=indices.device
+            )[None, :]
+        ).flatten()
         return flattened_indices
 
     def ras_selection(self, sample, diff, height, width):
         diff = diff.squeeze(0).permute(1, 2, 0)
         # calculate the metric for each patch
         if ras_manager.MANAGER.metric == "std":
-            metric = torch.std(diff, dim=-1).view(height // ras_manager.MANAGER.patch_size, ras_manager.MANAGER.patch_size, width // ras_manager.MANAGER.patch_size, ras_manager.MANAGER.patch_size).transpose(-2, -3).mean(-1).mean(-1).view(-1)
+            metric = (
+                torch.std(diff, dim=-1)
+                .view(
+                    height // ras_manager.MANAGER.patch_size,
+                    ras_manager.MANAGER.patch_size,
+                    width // ras_manager.MANAGER.patch_size,
+                    ras_manager.MANAGER.patch_size,
+                )
+                .transpose(-2, -3)
+                .mean(-1)
+                .mean(-1)
+                .view(-1)
+            )
         elif ras_manager.MANAGER.metric == "l2norm":
-            metric = torch.norm(diff, p=2, dim=-1).view(height // ras_manager.MANAGER.patch_size, ras_manager.MANAGER.patch_size, width // ras_manager.MANAGER.patch_size, ras_manager.MANAGER.patch_size).transpose(-2, -3).mean(-1).mean(-1).view(-1)
+            metric = (
+                torch.norm(diff, p=2, dim=-1)
+                .view(
+                    height // ras_manager.MANAGER.patch_size,
+                    ras_manager.MANAGER.patch_size,
+                    width // ras_manager.MANAGER.patch_size,
+                    ras_manager.MANAGER.patch_size,
+                )
+                .transpose(-2, -3)
+                .mean(-1)
+                .mean(-1)
+                .view(-1)
+            )
         else:
             raise ValueError("Unknown metric")
 
         # scale the metric with the drop count to avoid starvation
         metric *= torch.exp(ras_manager.MANAGER.starvation_scale * self.drop_cnt)
         current_skip_num = ras_manager.MANAGER.skip_token_num_list[self._step_index + 1]
-        assert ras_manager.MANAGER.high_ratio >= 0 and ras_manager.MANAGER.high_ratio <= 1, "High ratio should be in the range of [0, 1]"
+        assert (
+            ras_manager.MANAGER.high_ratio >= 0 and ras_manager.MANAGER.high_ratio <= 1
+        ), "High ratio should be in the range of [0, 1]"
         indices = torch.sort(metric, dim=0, descending=False).indices
         low_bar = int(current_skip_num * (1 - ras_manager.MANAGER.high_ratio))
         high_bar = int(current_skip_num * ras_manager.MANAGER.high_ratio)
         cached_patchified_indices = torch.cat([indices[:low_bar], indices[-high_bar:]])
         other_patchified_indices = indices[low_bar:-high_bar]
         self.drop_cnt[cached_patchified_indices] += 1
-        latent_cached_indices = self.extract_latents_index_from_patched_latents_index(cached_patchified_indices, height)
+        latent_cached_indices = self.extract_latents_index_from_patched_latents_index(
+            cached_patchified_indices, height
+        )
 
         return latent_cached_indices, other_patchified_indices
-
 
     def step(
         self,
@@ -187,10 +234,19 @@ class RASFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
         latent_dim, height, width = sample.shape[-3:]
 
-        assert ras_manager.MANAGER.sample_ratio > 0.0 and ras_manager.MANAGER.sample_ratio <= 1.0
+        assert (
+            ras_manager.MANAGER.sample_ratio > 0.0
+            and ras_manager.MANAGER.sample_ratio <= 1.0
+        )
         if ras_manager.MANAGER.sample_ratio < 1.0 and ras_manager.MANAGER.is_RAS_step:
-            model_output.squeeze(0).view(latent_dim, -1)[:, ras_manager.MANAGER.cached_index] = ras_manager.MANAGER.cached_scaled_noise
-            model_output = model_output.transpose(0, 1).view(latent_dim, height, width).unsqueeze(0)
+            model_output.squeeze(0).view(latent_dim, -1)[
+                :, ras_manager.MANAGER.cached_index
+            ] = ras_manager.MANAGER.cached_scaled_noise
+            model_output = (
+                model_output.transpose(0, 1)
+                .view(latent_dim, height, width)
+                .unsqueeze(0)
+            )
 
         # Upcast to avoid precision issues when computing prev_sample
         sample = sample.to(torch.float32)
@@ -204,9 +260,16 @@ class RASFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         # Cast sample back to model compatible dtype
         prev_sample = prev_sample.to(model_output.dtype)
 
-        if ras_manager.MANAGER.sample_ratio < 1.0 and ras_manager.MANAGER.is_next_RAS_step:
-            latent_cached_indices, other_patchified_indices = self.ras_selection(sample, diff, height, width)
-            ras_manager.MANAGER.cached_scaled_noise = model_output.squeeze(0).view(latent_dim, -1)[:, latent_cached_indices]
+        if (
+            ras_manager.MANAGER.sample_ratio < 1.0
+            and ras_manager.MANAGER.is_next_RAS_step
+        ):
+            latent_cached_indices, other_patchified_indices = self.ras_selection(
+                sample, diff, height, width
+            )
+            ras_manager.MANAGER.cached_scaled_noise = model_output.squeeze(0).view(
+                latent_dim, -1
+            )[:, latent_cached_indices]
             ras_manager.MANAGER.cached_index = latent_cached_indices
             ras_manager.MANAGER.other_patchified_index = other_patchified_indices
 
